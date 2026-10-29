@@ -51,8 +51,13 @@ JS = r"""
   const inFold = r => Math.max(0, Math.min(r.right, VW) - Math.max(r.left, 0)) * Math.max(0, Math.min(r.bottom, VH) - Math.max(r.top, 0));
 
   const T = new Set(), B = new Set(), BO = new Set(), F = new Set(), FW = new Set(), R = new Set(), S = new Set();
-  const SERIF = new Set(); let serifChars = 0, textChars = 0;
-  const SERIF_RE = /(simsun|songti|song|simsun|宋体|宋体|新宋|仿宋|fangsong|kaiti|楷体|serif|stsong|songti ?sc|noto ?serif ?(cjk|sc)|source ?han ?serif)/i;
+  const SERIF = new Set(); let serifChars = 0, textChars = 0, cjkChars = 0, cjkSerifChars = 0;
+  // 显式衬线中文字体（宋体/仿宋/楷体/思源宋体…）
+  const SERIF_RE = /(simsun|songti|宋体|新宋|仿宋|fangsong|kaiti|楷体|stsong|noto ?serif ?(cjk|sc)|source ?han ?serif)/i;
+  // 黑体族（中文网页的正统选择）
+  const CJK_SANS_RE = /(pingfang|hei ?ti|hei-ti|noto ?sans ?(cjk|sc)|source ?han ?sans|harmonyos ?sans|yahei|微软雅黑|苹方)/i;
+  const HAS_CJK = /[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uff00-\uffef]/;
+  const GENERIC_SERIF = /(^|[\s,])serif$|serif(\s*,|$)/i;
   const FS = {}; const body = []; let grad = 0, maxW = 0, hero = 0, heroText = '', media = 0;
   const els = [...document.querySelectorAll('body *')].slice(0, 6000);
   for (const e of els) {
@@ -60,10 +65,24 @@ JS = r"""
     const s = getComputedStyle(e), r = e.getBoundingClientRect(), t = ownText(e);
     if (t.length > 1) {
       T.add(s.color); FW.add(s.fontWeight);
-      const fam = s.fontFamily.split(',')[0].replace(/["']/g, '').trim();
+      const stack = s.fontFamily;
+      const fam = stack.split(',')[0].replace(/["']/g, '').trim();
       const famLow = fam.toLowerCase();
       F.add(famLow);
       if (SERIF_RE.test(fam)) { SERIF.add(famLow); serifChars += t.length; }
+      // 中文实际回退检测：中文网页常写 font-family: "Optima", Georgia, serif，
+      // 拉丁走 Optima，而中文字形回退到系统衬线（宋体/明朝体）。
+      // 判断依据：整条栈里没有可用中文字体的黑体族，且以泛型 serif 兜底。
+      if (HAS_CJK.test(t)) {
+        cjkChars += t.length;
+        const hasCJKSerif = SERIF_RE.test(stack);
+        const hasCJKSans = CJK_SANS_RE.test(stack);
+        const genericSerif = GENERIC_SERIF.test(stack);
+        if (hasCJKSerif || (!hasCJKSans && genericSerif)) {
+          cjkSerifChars += t.length;
+          SERIF.add(famLow + '→(中文字形回退衬线)');
+        }
+      }
       textChars += t.length;
       FS[s.fontSize] = (FS[s.fontSize] || 0) + 1;
       const fs = parseFloat(s.fontSize), c = parse(s.color);
@@ -107,6 +126,9 @@ JS = r"""
     loginWall, hasPassword, bodyTextLen,
     serifFonts: [...SERIF].slice(0, 8),
     serifCharShare: textChars ? serifChars / textChars : 0,
+    cjkChars, cjkSerifChars,
+    cjkSerifShare: cjkChars ? cjkSerifChars / cjkChars : 0,
+    cjkFontFallback: cjkChars ? cjkSerifChars / cjkChars > 0.15 : false,
     textColorList: [...T].slice(0, 20), bgColorList: [...B].slice(0, 20),
   };
 }
@@ -157,14 +179,17 @@ def score_metrics(m):
     color = clamp(100 - max(0, ncol - 12) * 5 - max(0, m["gradients"] - 3) * 1.5)
     typ = clamp(100 - max(0, m["fontSizesSig"] - 7) * 10 - max(0, m["fontCount"] - 2) * 12
                 - max(0, m["fontWeights"] - 3) * 8)
-    # 宋体/仿宋/楷体等衬线中文字体在现代网页里属于过时选择（国内主流是黑体族），
-    # 正文一旦以宋体为主，字体分额外扣分，并在报告里点名。
-    serif_share = m.get("serifCharShare") or 0
+    # 宋体/仿宋/楷体等衬线中文字体在现代网页里属于过时选择（国内主流是黑体族）。
+    # 用 cjkSerifShare（中文字形里实际落到衬线的比例）判定，比看 CSS 首个字族准：
+    # 中文网页常写 font-family:"Optima",Georgia,serif，中文会静默回退成宋体。
+    serif_share = m.get("cjkSerifShare") or m.get("serifCharShare") or 0
     serif_penalty = 0
     if serif_share >= 0.5:
         serif_penalty = 10
     elif serif_share >= 0.2:
         serif_penalty = 5
+    elif serif_share >= 0.15:
+        serif_penalty = 3
     typ = clamp(typ - serif_penalty)
     cons = clamp(100 - max(0, m["radii"] - 3) * 8 - max(0, m["shadows"] - 3) * 10)
     hb = m["heroSize"] / (m["bodySize"] or 16)
@@ -176,8 +201,11 @@ def score_metrics(m):
                     - (15 if m["bodySize"] < 14 else 0))
     metric = 0.25 * color + 0.25 * typ + 0.15 * cons + 0.15 * hier + 0.20 * acc
     return {"colorsTotal": ncol, "heroBodyRatio": round(hb, 2),
-            "serifCharShare": round(serif_share, 3), "serifPenalty": serif_penalty,
+            "serifCharShare": round(m.get("serifCharShare") or 0, 3),
+            "cjkSerifShare": round(serif_share, 3),
+            "serifPenalty": serif_penalty,
             "serifFonts": m.get("serifFonts", []),
+            "cjkFontFallback": bool(m.get("cjkFontFallback")),
             "m_color": round(color), "m_type": round(typ), "m_consist": round(cons),
             "m_hier": round(hier), "m_access": round(acc), "metric_score": round(metric, 1)}
 
@@ -272,11 +300,14 @@ def _report_zh(url, m, s, industry, mobile, hero=None):
     lines += _metric_rows(m, s, True)
     lines += ["", f"字体：{', '.join(m['fonts'])}", f"常用字号：{', '.join(m['topFontSizes'])}",
               f"Hero 文本：{m['heroText']!r}｜首屏媒体占比 {m['heroMediaRatio']:.0%}｜max-width {m['maxWidth'] or '-'}px", ""]
-    if m.get("serifCharShare"):
+    if m.get("cjkSerifShare") or m.get("serifCharShare"):
+        share = m.get("cjkSerifShare") or m.get("serifCharShare")
         lines.insert(len(lines) - 1,
-                     f"⚠️ 衬线中文字体占比 {m['serifCharShare']:.0%}"
+                     f"⚠️ 中文字形落到衬线字体的比例 {share:.0%}"
                      + (f"（{', '.join(m.get('serifFonts') or [])}）" if m.get("serifFonts") else "")
-                     + "：中文网页正文应改用黑体族（思源黑体 / 苹方 / 微软雅黑）")
+                     + "：中文网页正文应改用黑体族（思源黑体 / 苹方 / 微软雅黑）"
+                     + ("；注意 font-family 里的拉丁字体不含中文字形，中文会静默回退成宋体/明朝体"
+                        if m.get("cjkFontFallback") else ""))
     if m.get("loginWall"):
         lines.insert(len(lines) - 1,
                      "⚠️ 采集到的是登录页/后台鉴权页（loginWall=true），"
